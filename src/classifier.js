@@ -43,21 +43,41 @@ function legalCapturesOf(fen, color, square, piece) {
  * For quiet moves (no capture): we additionally require the piece was NOT already
  * under attack before the move, so we don't misclassify escape-moves as sacrifices.
  */
+function staticExchangeSwing(afterFen, move) {
+  const board = new Chess(afterFen);
+  const gains = [move.captured ? PIECE_VALUE[move.captured] : 0];
+  let occupantValue = PIECE_VALUE[move.piece];
+  let side = move.color === "w" ? "b" : "w";
+
+  for (let ply = 0; ply < 16; ply += 1) {
+    const fields = board.fen().split(" ");
+    fields[1] = side;
+    const probe = new Chess(fields.join(" "));
+    const captures = probe.moves({ verbose: true }).filter((m) => m.to === move.to);
+    if (!captures.length) break;
+    captures.sort((a, b) => PIECE_VALUE[a.piece] - PIECE_VALUE[b.piece]);
+    const capture = captures[0];
+    gains.push(occupantValue - gains[gains.length - 1]);
+    const attacker = board.get(capture.from);
+    board.remove(move.to);
+    board.remove(capture.from);
+    board.put({ type: attacker.type, color: attacker.color }, move.to);
+    occupantValue = PIECE_VALUE[capture.piece];
+    side = side === "w" ? "b" : "w";
+  }
+
+  for (let i = gains.length - 1; i > 0; i -= 1) gains[i - 1] = -Math.max(-gains[i - 1], gains[i]);
+  return gains[0];
+}
+
 function hasVoluntaryPieceSacrifice(move, positions, index) {
   if (!NON_PAWN_PIECES.has(move.piece)) return false;
 
-  // Material given up must exceed material taken (otherwise it's an exchange, not a sac).
-  const capturedValue = move.captured ? PIECE_VALUE[move.captured] : 0;
-  if (PIECE_VALUE[move.piece] <= capturedValue) return false;
+  const swing = staticExchangeSwing(positions[index + 1], move);
+  if (swing >= 0) return false; // fair trade or better — not a sacrifice
 
-  // The opponent must be able to recapture on the landing square.
-  const opponent = move.color === "w" ? "b" : "w";
-  const afterCaptures = legalCapturesOf(positions[index + 1], opponent, move.to, move.piece);
-  if (!afterCaptures.length) return false;
-
-  // For quiet moves only: if the piece was already capturable at its origin,
-  // this is an escape move, not a sacrifice.
   if (!move.captured) {
+    const opponent = move.color === "w" ? "b" : "w";
     const beforeCaptures = legalCapturesOf(positions[index], opponent, move.from, move.piece);
     if (beforeCaptures.length > 0) return false;
   }
