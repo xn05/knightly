@@ -1,0 +1,123 @@
+import { Chess } from "chess.js";
+
+const PIECE_VALUE = { p: 1, n: 3, b: 3, r: 5, q: 9, k: 99 };
+const NON_PAWN_PIECES = new Set(["n", "b", "r", "q"]);
+
+/**
+ * Converts a white-perspective Stockfish evaluation into an expected score.
+ * The 0.0035 gradient and public cut-offs match Chess.com's published model;
+ * its rating-specific data model remains private.
+ */
+export function expectedPoints(evaluation) {
+  if (evaluation.type === "mate") return evaluation.value > 0 ? 1 : evaluation.value < 0 ? 0 : 0.5;
+  return 1 / (1 + Math.exp(-0.0035 * evaluation.value));
+}
+
+function playerPoints(evaluation, color) {
+  const whitePoints = expectedPoints(evaluation);
+  return color === "w" ? whitePoints : 1 - whitePoints;
+}
+
+function legalCapturesOf(fen, color, square, piece) {
+  const fields = fen.split(" ");
+  fields[1] = color;
+  const board = new Chess(fields.join(" "));
+  return board.moves({ verbose: true }).filter(move => move.to === square && move.captured === piece);
+}
+
+function hasVoluntaryPieceSacrifice(move, positions, index) {
+  if (!NON_PAWN_PIECES.has(move.piece)) return false;
+
+  const capturedValue = move.captured ? PIECE_VALUE[move.captured] : 0;
+  if (PIECE_VALUE[move.piece] <= capturedValue) return false; // Exchanges are not sacrifices.
+
+  const opponent = move.color === "w" ? "b" : "w";
+  const afterCaptures = legalCapturesOf(positions[index + 1], opponent, move.to, move.piece);
+  if (!afterCaptures.length) return false;
+
+  // Moving a piece that was already capturable is normally an escape, not a sac.
+  const beforeCaptures = legalCapturesOf(positions[index], opponent, move.from, move.piece);
+  return beforeCaptures.length === 0;
+}
+
+function isFreeCapture(move, positions, index) {
+  if (!move.captured) return false;
+  const before = new Chess(positions[index]);
+  const captureSquare = move.flags.includes("e")
+    ? `${move.to[0]}${move.color === "w" ? "5" : "4"}`
+    : move.to;
+  const defenders = before.attackers(captureSquare, move.color).filter(square => square !== move.from);
+  return defenders.length === 0;
+}
+
+function isForcedPosition(positions, index) {
+  return new Chess(positions[index]).moves().length <= 1;
+}
+
+function isMiss(move, previous, current) {
+  const before = playerPoints(previous, move.color);
+  const after = playerPoints(current, move.color);
+  const wasWinningMate = previous.type === "mate" && playerPoints(previous, move.color) === 1;
+
+  // Missing a forced win but remaining at least equal is a Miss, not a Blunder.
+  if (wasWinningMate && current.type !== "mate" && after >= 0.45) return true;
+
+  // A missed conversion: the engine expected a winning continuation, but the
+  // played move gives the opponent a viable game without actually losing.
+  return before >= 0.85 && after >= 0.45 && after < 0.55;
+}
+
+function isGreatMove({ move, positions, index, loss, bestMove, secondEvaluation, previous, current }) {
+  if (loss >= 0.02 || bestMove !== move.san || isForcedPosition(positions, index) || isFreeCapture(move, positions, index)) return false;
+
+  const before = playerPoints(previous, move.color);
+  const after = playerPoints(current, move.color);
+  const second = secondEvaluation ? playerPoints(secondEvaluation, move.color) : null;
+  const onlyGoodMove = second !== null && before - second >= 0.1;
+  const savesOrWins = before < 0.45 && after >= 0.5;
+  return onlyGoodMove || savesOrWins;
+}
+
+function isBrilliantMove({ move, positions, index, loss, secondEvaluation, previous, current }) {
+  if (loss >= 0.02 || isForcedPosition(positions, index) || !hasVoluntaryPieceSacrifice(move, positions, index)) return false;
+
+  const after = playerPoints(current, move.color);
+  const second = secondEvaluation ? playerPoints(secondEvaluation, move.color) : playerPoints(previous, move.color);
+
+  // A Brilliant is a sound, near-best sacrifice from a position that was not
+  // already trivially won with any continuation.
+  return after >= 0.5 && second < 0.95;
+}
+
+/**
+ * Classify a played move from Stockfish's before/after evaluations and its
+ * top three lines. This is an independent implementation of the published
+ * expected-points rules, not a claim to reproduce Chess.com's private model.
+ */
+export function classifyMove({ index, moves, positions, evaluations, bestMoves, engineLines, isTheory }) {
+  if (index < 0 || !moves[index] || !evaluations.has(index) || !evaluations.has(index - 1)) return null;
+  if (isTheory?.(index)) return "theory";
+
+  const move = moves[index];
+  const previous = evaluations.get(index - 1);
+  const current = evaluations.get(index);
+  const before = playerPoints(previous, move.color);
+  const after = playerPoints(current, move.color);
+  const loss = Math.max(0, before - after);
+  const topLines = engineLines.get(index - 1);
+  const secondEvaluation = topLines?.[2] || null;
+  const bestMove = bestMoves.get(index - 1);
+
+  if (isMiss(move, previous, current)) return "miss";
+  if (isBrilliantMove({ move, positions, index, loss, secondEvaluation, previous, current })) return "brilliant";
+  if (isGreatMove({ move, positions, index, loss, bestMove, secondEvaluation, previous, current })) return "great";
+
+  // Best is reserved for Stockfish's top line. All other moves use the
+  // published expected-points intervals below.
+  if (bestMove === move.san) return "best";
+  if (loss < 0.02) return "excellent";
+  if (loss < 0.05) return "good";
+  if (loss < 0.1) return "inaccuracy";
+  if (loss < 0.2) return "mistake";
+  return "blunder";
+}

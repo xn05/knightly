@@ -1,0 +1,642 @@
+import "./style.css";
+import { Chess } from "chess.js";
+import { createBoard } from "./board.js";
+import { classifyMove } from "./classifier.js";
+import bestIcon from "./assets/best.png";
+import blunderIcon from "./assets/blunder.png";
+import excellentIcon from "./assets/excellent.png";
+import goodIcon from "./assets/good.png";
+import greatIcon from "./assets/great.png";
+import inaccuracyIcon from "./assets/inaccuracy.png";
+import mistakeIcon from "./assets/mistake.png";
+import theoryIcon from "./assets/theory.png";
+import brilliantIcon from "./assets/brilliant.png";
+import missIcon from "./assets/miss.png";
+import openings from "./assets/openings.json";
+
+const icons = { best: bestIcon, blunder: blunderIcon, excellent: excellentIcon, good: goodIcon, great: greatIcon, inaccuracy: inaccuracyIcon, mistake: mistakeIcon, theory: theoryIcon, brilliant: brilliantIcon, miss: missIcon };
+const qualityColours = { brilliant: "#1baaa6", best: "#98bc49", excellent: "#98bc49", good: "#97af8b", great: "#5b8baf", theory: "#a88764", inaccuracy: "#f4bf44", mistake: "#e28c28", blunder: "#c93230", miss: "#a88764" };
+
+document.querySelector("#app").innerHTML = `
+<main class="shell">
+  <header class="topbar">
+    <a class="brand" href="#"><span class="brand-mark">&#9822;</span>Knightly</a>
+    <div class="header-actions">
+      <button class="settings-button" id="settings-button">Settings</button>
+      <button class="settings-button" id="load-pgn-button">Load PGN</button>
+    </div>
+  </header>
+  <section class="review-layout">
+    <aside class="evaluation">
+      <span id="eval-label">0.00</span>
+      <div id="eval-fill"></div>
+    </aside>
+    <div class="board-area">
+      <div class="player-bar player-bar--top" id="player-top">
+        <div class="player-avatar">&#9818;</div>
+        <span class="player-name" id="player-top-name">Black</span>
+      </div>
+      <div class="board-wrap">
+        <div id="board"></div>
+      </div>
+      <i class="move-highlight hidden" id="from-highlight"></i>
+      <i class="move-highlight hidden" id="to-highlight"></i>
+      <img class="move-badge hidden" id="move-badge" alt="Move quality">
+      <div class="player-bar player-bar--bottom" id="player-bottom">
+        <div class="player-avatar player-avatar--white">&#9812;</div>
+        <span class="player-name" id="player-bottom-name">White</span>
+      </div>
+      <div class="board-actions">
+        <button id="flip">Flip board</button>
+        <span id="engine-status">Starting engine…</span>
+      </div>
+    </div>
+    <section class="analysis-panel">
+      <div class="panel-heading">
+        <div>
+          <p>GAME REVIEW</p>
+          <h1>Move analysis</h1>
+          <div class="game-opening" id="game-opening">Starting position</div>
+        </div>
+        <button class="icon-button" id="new-game">&#8634;</button>
+      </div>
+      <div class="current-move" id="current-move"></div>
+      <div class="move-summary" id="move-summary"></div>
+      <div class="move-list" id="move-list"></div>
+      <div class="navigation">
+        <button id="first">&#124;&#8249;</button>
+        <button id="previous">&#8249;</button>
+        <button id="next">&#8250;</button>
+        <button id="last">&#8250;&#124;</button>
+      </div>
+    </section>
+  </section>
+</main>
+
+<!-- Settings modal -->
+<div class="settings-backdrop hidden" id="settings-backdrop">
+  <section class="settings-card" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <div><p>ENGINE SETTINGS</p><h2 id="settings-title">Analysis depth</h2></div>
+    <div class="depth-value"><span id="depth-value">16</span><small>ply</small></div>
+    <input id="depth-slider" type="range" min="8" max="22" value="16">
+    <div class="depth-scale"><span>Fast</span><span>Stronger · slower</span></div>
+    <button id="close-settings">Done</button>
+  </section>
+</div>
+
+<!-- PGN loader modal -->
+<div class="settings-backdrop hidden" id="pgn-backdrop">
+  <section class="settings-card pgn-card" role="dialog" aria-modal="true" aria-labelledby="pgn-title">
+    <div><p>IMPORT GAME</p><h2 id="pgn-title">Load PGN</h2></div>
+    
+    <div id="pgn-panel-paste" class="pgn-panel">
+      <textarea id="pgn-textarea" placeholder="Paste your PGN here…" spellcheck="false"></textarea>
+    </div>
+    <div id="pgn-panel-file" class="pgn-panel hidden">
+      <label class="pgn-file-label" id="pgn-file-label">
+        <span id="pgn-file-label-text">Choose a .pgn file</span>
+        <input type="file" id="pgn-file" accept=".pgn,text/plain">
+      </label>
+    </div>
+    <div class="pgn-actions">
+      <button id="pgn-cancel" class="pgn-btn-cancel">Cancel</button>
+      <button id="pgn-load" class="pgn-btn-load">Load game</button>
+    </div>
+  </section>
+</div>
+
+<!-- Promotion modal -->
+<div class="promotion-backdrop hidden" id="promotion-backdrop">
+  <section class="promotion-card" role="dialog" aria-modal="true" aria-label="Choose promotion">
+    <p>Promote pawn to</p>
+    <div>
+      <button data-piece="q">♕</button>
+      <button data-piece="r">♖</button>
+      <button data-piece="b">♗</button>
+      <button data-piece="n">♘</button>
+    </div>
+  </section>
+</div>`;
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let moves = [], positions = [new Chess().fen()], current = -1, position = new Chess();
+let engineReady = false, engine, activeAnalysis = null, analysisQueue = [], analysisRevision = 0;
+let flipped = false, analysisDepth = 16, pendingPromotion = null, pendingEngineResult = null;
+let mainLine = null, branchStart = null;
+let playerWhite = "White", playerBlack = "Black";
+
+const evaluations = new Map();
+const bestMoves    = new Map();
+const engineLines  = new Map();
+
+const board = createBoard(document.getElementById("board"), makeMove);
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+const legalDests = chess => {
+  const dests = new Map();
+  chess.moves({ verbose: true }).forEach(m => {
+    if (!dests.has(m.from)) dests.set(m.from, []);
+    dests.get(m.from).push(m.to);
+  });
+  return dests;
+};
+
+function syncBoard() {
+  position = new Chess(positions[current + 1]);
+  const turnColor = position.turn() === "w" ? "white" : "black";
+  board.set({
+    fen: position.fen(),
+    turnColor,
+    lastMove: current >= 0 ? [moves[current].from, moves[current].to] : undefined,
+    movable: { free: false, color: turnColor, dests: legalDests(position), events: { after: makeMove } },
+    premovable: { enabled: false },
+  });
+}
+
+function resetAnalysisCache() {
+  analysisRevision += 1;
+  evaluations.clear();
+  bestMoves.clear();
+  engineLines.clear();
+}
+
+// ── Player nameplates ─────────────────────────────────────────────────────────
+function updatePlayerBars() {
+  // When flipped, black is at the bottom
+  const bottomIsBlack = !flipped;
+  document.getElementById("player-top-name").textContent    = bottomIsBlack ? playerBlack : playerWhite;
+  document.getElementById("player-bottom-name").textContent = bottomIsBlack ? playerWhite : playerBlack;
+
+  const topAvatar    = document.querySelector("#player-top .player-avatar");
+  const bottomAvatar = document.querySelector("#player-bottom .player-avatar");
+
+  if (bottomIsBlack) {
+    topAvatar.textContent    = "♚";
+    topAvatar.className      = "player-avatar player-avatar--black";
+    bottomAvatar.textContent = "♔";
+    bottomAvatar.className   = "player-avatar player-avatar--white";
+  } else {
+    topAvatar.textContent    = "♔";
+    topAvatar.className      = "player-avatar player-avatar--white";
+    bottomAvatar.textContent = "♚";
+    bottomAvatar.className   = "player-avatar player-avatar--black";
+  }
+}
+
+// ── Move / game logic ─────────────────────────────────────────────────────────
+function commitMove(from, to, promotion) {
+  const expectedMove = moves[current + 1];
+  if (mainLine && moves === mainLine.moves && expectedMove &&
+      expectedMove.from === from && expectedMove.to === to &&
+      (!expectedMove.promotion || expectedMove.promotion === promotion)) {
+    return setMove(current + 1);
+  }
+  const move = position.move({ from, to, promotion });
+  if (!move) return syncBoard();
+  if (mainLine && moves === mainLine.moves) {
+    branchStart = current + 1;
+    moves     = moves.slice(0, current + 1);
+    positions = positions.slice(0, current + 2);
+    resetAnalysisCache();
+  } else {
+    moves     = moves.slice(0, current + 1);
+    positions = positions.slice(0, current + 2);
+  }
+  moves.push(move);
+  positions.push(position.fen());
+  current += 1;
+  evaluations.delete(current);
+  setMove(current);
+}
+
+function makeMove(from, to) {
+  const movingPiece = position.get(from);
+  if (movingPiece?.type === "p" && (to[1] === "1" || to[1] === "8")) {
+    pendingPromotion = { from, to };
+    syncBoard();
+    document.getElementById("promotion-backdrop").classList.remove("hidden");
+    return;
+  }
+  commitMove(from, to, "q");
+}
+
+function newGame() {
+  moves = []; positions = [new Chess().fen()];
+  mainLine = null; branchStart = null; current = -1;
+  playerWhite = "White"; playerBlack = "Black";
+  resetAnalysisCache();
+  updatePlayerBars();
+  setMove(-1);
+}
+
+function loadPgn(pgn) {
+  const parsed = new Chess();
+  try { parsed.loadPgn(pgn); }
+  catch (error) { alert(`Illegal PGN: ${error.message}`); return; }
+  const loaded = parsed.history({ verbose: true });
+  if (!loaded.length) { alert("No legal moves found in this PGN."); return; }
+
+  // Extract player names from PGN headers
+  const whiteMatch = pgn.match(/\[White\s+"([^"]+)"\]/);
+  const blackMatch = pgn.match(/\[Black\s+"([^"]+)"\]/);
+  playerWhite = whiteMatch ? whiteMatch[1] : "White";
+  playerBlack = blackMatch ? blackMatch[1] : "Black";
+
+  const replay = new Chess();
+  moves = []; positions = [replay.fen()];
+  loaded.forEach(m => { moves.push(replay.move(m)); positions.push(replay.fen()); });
+  mainLine = { moves, positions };
+  branchStart = null;
+  resetAnalysisCache();
+  updatePlayerBars();
+  setMove(-1);
+}
+
+// ── Opening / theory ──────────────────────────────────────────────────────────
+function isTheory(index) {
+  return index >= 0 && Boolean(openings[positions[index + 1].split(" ")[0]]);
+}
+function openingNameAt(index) {
+  for (let i = index; i >= -1; i--) {
+    const name = openings[positions[i + 1].split(" ")[0]];
+    if (name) return name;
+  }
+  return "Starting position";
+}
+
+// ── Classification / rendering ────────────────────────────────────────────────
+function moveQuality(index) {
+  return classifyMove({ index, moves, positions, evaluations, bestMoves, engineLines, isTheory });
+}
+
+function moveCell(move, index) {
+  if (!move) return `<span class="move-cell empty"></span>`;
+  const quality = moveQuality(index);
+  return `<button class="move-cell ${index === current ? "selected" : ""}" data-index="${index}">
+    ${quality ? `<img src="${icons[quality]}" alt="">` : ""}
+    <span>${move.san}</span>
+  </button>`;
+}
+
+function renderMoves() {
+  let rows = "";
+  for (let i = 0; i < moves.length; i += 2) {
+    rows += `<div class="move-pair">
+      <span class="move-number">${i / 2 + 1}.</span>
+      ${moveCell(moves[i], i)}${moveCell(moves[i + 1], i + 1)}
+    </div>`;
+  }
+  document.getElementById("move-list").innerHTML = rows;
+  document.querySelectorAll(".move-cell[data-index]").forEach(btn =>
+    btn.onclick = () => setMove(Number(btn.dataset.index))
+  );
+}
+
+function updateMoveSummary() {
+  const summary = document.getElementById("move-summary");
+  const move    = moves[current];
+  const quality = moveQuality(current);
+  if (!move || !quality) { summary.innerHTML = ""; summary.classList.remove("visible"); return; }
+  const label = quality[0].toUpperCase() + quality.slice(1);
+  summary.innerHTML = `
+    <img src="${icons[quality]}" alt="">
+    <strong>${move.san} ${label}.</strong>
+    <span>${bestMoveText(current) ? `Best was ${bestMoveText(current)}` : "Analysed by Stockfish"}</span>`;
+  summary.classList.add("visible");
+}
+
+// ── Badge / highlight positioning ─────────────────────────────────────────────
+// Highlights and badge live in .board-area (outside .board-wrap) so board-wrap
+// keeps its border-radius without clipping them.
+function squarePosition(square) {
+  const file = square.charCodeAt(0) - 97;
+  const rank = Number(square[1]) - 1;
+  return { x: flipped ? 7 - file : file, y: flipped ? rank : 7 - rank };
+}
+
+function boardGeometry() {
+  const area      = document.querySelector(".board-area").getBoundingClientRect();
+  const boardWrap = document.querySelector(".board-wrap").getBoundingClientRect();
+  // Position of board-wrap relative to board-area
+  const left   = boardWrap.left   - area.left;
+  const top    = boardWrap.top    - area.top;
+  const width  = boardWrap.width;
+  const height = boardWrap.height;
+  return { left, top, width, height, square: width / 8 };
+}
+
+function placeBadge() {
+  const badge         = document.getElementById("move-badge");
+  const fromHighlight = document.getElementById("from-highlight");
+  const toHighlight   = document.getElementById("to-highlight");
+  const move    = moves[current];
+  const quality = moveQuality(current);
+
+  if (!move || !quality) {
+    badge.classList.add("hidden");
+    fromHighlight.classList.add("hidden");
+    toHighlight.classList.add("hidden");
+    return;
+  }
+
+  const from     = squarePosition(move.from);
+  const to       = squarePosition(move.to);
+  const colour   = qualityColours[quality];
+  const geometry = boardGeometry();
+
+  [fromHighlight, toHighlight].forEach((el, i) => {
+    const pt = i ? to : from;
+    el.style.left            = `${geometry.left + pt.x * geometry.square}px`;
+    el.style.top             = `${geometry.top  + pt.y * geometry.square}px`;
+    el.style.width           = `${geometry.square}px`;
+    el.style.height          = `${geometry.square}px`;
+    el.style.backgroundColor = colour;
+    el.classList.remove("hidden");
+  });
+
+  const badgeSize = geometry.square * 0.58;
+  const rawLeft   = geometry.left + (to.x + 1) * geometry.square - badgeSize * 0.52;
+  const rawTop    = geometry.top  +  to.y       * geometry.square - badgeSize * 0.18;
+  badge.src        = icons[quality];
+  badge.style.width  = `${badgeSize}px`;
+  badge.style.height = `${badgeSize}px`;
+  badge.style.left   = `${Math.min(geometry.left + geometry.width  - badgeSize, Math.max(geometry.left, rawLeft))}px`;
+  badge.style.top    = `${Math.min(geometry.top  + geometry.height - badgeSize, Math.max(geometry.top,  rawTop))}px`;
+  badge.classList.remove("hidden");
+}
+
+new ResizeObserver(placeBadge).observe(document.getElementById("board"));
+
+// ── Eval bar ──────────────────────────────────────────────────────────────────
+function scoreText(evaluation) {
+  if (evaluation.type === "mate") return `M${Math.abs(evaluation.value)}`;
+  return evaluation.value >= 0
+    ? `+${(evaluation.value / 100).toFixed(2)}`
+    : (evaluation.value / 100).toFixed(2);
+}
+
+function bestMoveText(moveIndex) {
+  return bestMoves.get(moveIndex - 1) || null;
+}
+
+// Only update the eval bar when we actually have a result — never reset to 50%.
+function displayEvaluation(evaluation) {
+  const barHeight = evaluation.type === "mate"
+    ? (evaluation.value > 0 ? 95 : 5)
+    : Math.max(6, Math.min(94, 50 + evaluation.value / 12));
+  document.getElementById("eval-fill").style.height = `${barHeight}%`;
+  document.getElementById("eval-label").textContent = scoreText(evaluation);
+}
+
+function updateDescription() {
+  const quality     = moveQuality(current);
+  const currentEval = evaluations.get(current);
+  const description = document.getElementById("move-description");
+  if (!description || !quality) return;
+  const evalText  = currentEval ? ` · ${scoreText(currentEval)}` : "";
+  const bestMove  = bestMoveText(current);
+  description.textContent = `${quality[0].toUpperCase()}${quality.slice(1)} move${evalText}${bestMove ? ` · Best: ${bestMove}` : ""}`;
+  updateMoveSummary();
+}
+
+function updateEvaluation(evaluation, index) {
+  evaluations.set(index, evaluation);
+  if (index === current) displayEvaluation(evaluation);
+  updateDescription();
+  renderMoves();
+  placeBadge();
+}
+
+function saveBestMove(index, uci) {
+  try {
+    const chess = new Chess(positions[index + 1]);
+    const san   = chess.move({ from: uci.slice(0, 2), to: uci.slice(2, 4), promotion: uci[4] });
+    if (san) bestMoves.set(index, san.san);
+  } catch { /* ignore incomplete lines */ }
+  if (index === current - 1) { updateDescription(); renderMoves(); placeBadge(); updateMoveSummary(); }
+}
+
+// ── setMove ───────────────────────────────────────────────────────────────────
+function setMove(index) {
+  current = Math.max(-1, Math.min(moves.length - 1, index));
+  syncBoard();
+  document.getElementById("game-opening").textContent = openingNameAt(current);
+
+  const move    = moves[current];
+  const quality = moveQuality(current);
+
+  document.getElementById("current-move").innerHTML = move
+    ? `<span>Move ${Math.ceil((current + 1) / 2)}${move.color === "w" ? "." : "…"}</span>
+       <strong>${move.san}</strong>
+       <small id="move-description">${quality ? `${quality[0].toUpperCase()}${quality.slice(1)} move` : "Analysing move…"}</small>`
+    : `<span>${position.turn() === "w" ? "White" : "Black"} to move</span>
+       <strong>Make a move</strong>
+       <small id="move-description">Opening</small>`;
+
+  // Only update eval bar if we already have the evaluation — never reset to 50%
+  if (evaluations.has(current)) {
+    displayEvaluation(evaluations.get(current));
+  }
+  // (If not yet evaluated the bar stays wherever it was)
+
+  renderMoves();
+  updateMoveSummary();
+  placeBadge();
+  scheduleAnalysis(current === -1 ? [-1] : [current - 1, current]);
+}
+
+// ── Engine ────────────────────────────────────────────────────────────────────
+function scheduleAnalysis(indices) {
+  if (!engineReady) return;
+  analysisQueue = [...new Set(
+    indices.filter(i => i >= -1 && !evaluations.has(i))
+  )].map(i => ({ index: i, revision: analysisRevision }));
+  runNextAnalysis();
+}
+
+function runNextAnalysis() {
+  if (!engineReady || activeAnalysis !== null || !analysisQueue.length) return;
+  activeAnalysis = analysisQueue.shift();
+  pendingEngineResult = null;
+  document.getElementById("engine-status").textContent = `Analysing depth ${analysisDepth}…`;
+  engine.postMessage(`position fen ${positions[activeAnalysis.index + 1]}`);
+  engine.postMessage(`go depth ${analysisDepth}`);
+}
+
+function startEngine() {
+  const status    = document.getElementById("engine-status");
+  const engineUrl = new URL(`${import.meta.env.BASE_URL}stockfish/stockfish-18-lite-single.js`, window.location.href).href;
+  engine = new Worker(engineUrl);
+  const timeout = window.setTimeout(() => {
+    if (!engineReady) status.textContent = "Engine did not start — check Console";
+  }, 12000);
+
+  engine.onmessage = ({ data }) => {
+    if (data === "uciok") { engine.postMessage("setoption name MultiPV value 3"); engine.postMessage("isready"); }
+    if (data === "readyok") {
+      window.clearTimeout(timeout);
+      engineReady = true;
+      status.textContent = "Stockfish ready";
+      scheduleAnalysis([-1]);
+    }
+
+    const scoreMatch   = typeof data === "string" && /\bscore (cp|mate) (-?\d+)/.exec(data);
+    const depthMatch   = typeof data === "string" && /\bdepth (\d+)/.exec(data);
+    const pvMatch      = typeof data === "string" && /\bpv\s+([a-h][1-8][a-h][1-8][qrbn]?)/.exec(data);
+    const multiPvMatch = typeof data === "string" && /\bmultipv (\d+)/.exec(data);
+    const multiPv      = multiPvMatch ? Number(multiPvMatch[1]) : 1;
+
+    if (pvMatch && activeAnalysis !== null && multiPv === 1) {
+      pendingEngineResult ??= {};
+      pendingEngineResult.uci = pvMatch[1];
+    }
+
+    if (scoreMatch && depthMatch && activeAnalysis !== null && Number(depthMatch[1]) >= 5) {
+      const depth      = Number(depthMatch[1]);
+      const value      = Number(scoreMatch[2]);
+      const whiteValue = positions[activeAnalysis.index + 1].split(" ")[1] === "b" ? -value : value;
+      const evaluation = { type: scoreMatch[1] === "mate" ? "mate" : "centipawn", value: whiteValue };
+      pendingEngineResult ??= {};
+      pendingEngineResult.lines ??= {};
+      const recorded = pendingEngineResult.lines[multiPv];
+      if (!recorded || depth >= recorded.depth) pendingEngineResult.lines[multiPv] = { depth, evaluation };
+      if (multiPv === 1 && (!pendingEngineResult.evaluationDepth || depth >= pendingEngineResult.evaluationDepth)) {
+        pendingEngineResult.evaluation      = evaluation;
+        pendingEngineResult.evaluationDepth = depth;
+      }
+    }
+
+    if (typeof data === "string" && data.startsWith("bestmove") && activeAnalysis !== null) {
+      const task             = activeAnalysis;
+      const finishedIndex    = task.index;
+      const isCurrentAnalysis = task.revision === analysisRevision;
+      if (isCurrentAnalysis && pendingEngineResult?.lines)
+        engineLines.set(finishedIndex, Object.fromEntries(
+          Object.entries(pendingEngineResult.lines).map(([rank, line]) => [rank, line.evaluation])
+        ));
+      if (isCurrentAnalysis && pendingEngineResult?.evaluation)
+        updateEvaluation(pendingEngineResult.evaluation, finishedIndex);
+      if (isCurrentAnalysis && pendingEngineResult?.uci)
+        saveBestMove(finishedIndex, pendingEngineResult.uci);
+      pendingEngineResult = null;
+      activeAnalysis      = null;
+      status.textContent  = "Stockfish ready";
+      runNextAnalysis();
+    }
+  };
+
+  engine.onerror = e => {
+    window.clearTimeout(timeout);
+    status.textContent = `Engine error: ${e.message || "worker could not load"}`;
+    console.error("Stockfish worker error", e);
+  };
+  engine.onmessageerror = e => {
+    window.clearTimeout(timeout);
+    status.textContent = "Engine error: invalid worker message";
+    console.error("Stockfish worker message error", e);
+  };
+
+  engine.postMessage("uci");
+}
+
+// ── Return to main line ───────────────────────────────────────────────────────
+function returnToMainLine(target) {
+  if (!mainLine || branchStart === null || target >= branchStart) return;
+  moves = mainLine.moves; positions = mainLine.positions;
+  branchStart = null;
+  resetAnalysisCache();
+}
+
+// ── Settings modal ────────────────────────────────────────────────────────────
+const settingsBackdrop = document.getElementById("settings-backdrop");
+const depthSlider      = document.getElementById("depth-slider");
+
+document.getElementById("settings-button").onclick = () => settingsBackdrop.classList.remove("hidden");
+document.getElementById("close-settings").onclick  = () => settingsBackdrop.classList.add("hidden");
+settingsBackdrop.onclick = e => { if (e.target === settingsBackdrop) settingsBackdrop.classList.add("hidden"); };
+depthSlider.oninput = () => {
+  analysisDepth = Number(depthSlider.value);
+  document.getElementById("depth-value").textContent = analysisDepth;
+  resetAnalysisCache();
+  scheduleAnalysis(current === -1 ? [-1] : [current - 1, current]);
+};
+
+// ── PGN modal ─────────────────────────────────────────────────────────────────
+const pgnBackdrop   = document.getElementById("pgn-backdrop");
+const pgnTabPaste   = document.getElementById("pgn-tab-paste");
+const pgnTabFile    = document.getElementById("pgn-tab-file");
+const pgnPanelPaste = document.getElementById("pgn-panel-paste");
+const pgnPanelFile  = document.getElementById("pgn-panel-file");
+const pgnTextarea   = document.getElementById("pgn-textarea");
+const pgnFileInput  = document.getElementById("pgn-file");
+const pgnFileLabelText = document.getElementById("pgn-file-label-text");
+
+document.getElementById("load-pgn-button").onclick = () => {
+  pgnTextarea.value = "";
+  pgnFileLabelText.textContent = "📄 Choose a .pgn file";
+  pgnBackdrop.classList.remove("hidden");
+};
+
+pgnTabPaste.onclick = () => {
+  pgnTabPaste.classList.add("active");
+  pgnTabFile.classList.remove("active");
+  pgnPanelPaste.classList.remove("hidden");
+  pgnPanelFile.classList.add("hidden");
+};
+
+pgnTabFile.onclick = () => {
+  pgnTabFile.classList.add("active");
+  pgnTabPaste.classList.remove("active");
+  pgnPanelFile.classList.remove("hidden");
+  pgnPanelPaste.classList.add("hidden");
+};
+
+pgnFileInput.onchange = async () => {
+  const file = pgnFileInput.files[0];
+  if (file) pgnFileLabelText.textContent = `📄 ${file.name}`;
+};
+
+document.getElementById("pgn-cancel").onclick = () => pgnBackdrop.classList.add("hidden");
+pgnBackdrop.onclick = e => { if (e.target === pgnBackdrop) pgnBackdrop.classList.add("hidden"); };
+
+document.getElementById("pgn-load").onclick = async () => {
+  let pgn = "";
+  if (!pgnPanelPaste.classList.contains("hidden")) {
+    pgn = pgnTextarea.value.trim();
+  } else {
+    const file = pgnFileInput.files[0];
+    if (!file) { alert("Please choose a PGN file."); return; }
+    pgn = await file.text();
+  }
+  if (!pgn) { alert("No PGN provided."); return; }
+  pgnBackdrop.classList.add("hidden");
+  loadPgn(pgn);
+};
+
+// ── Promotion modal ───────────────────────────────────────────────────────────
+document.querySelectorAll(".promotion-card button").forEach(btn => btn.onclick = () => {
+  if (!pendingPromotion) return;
+  document.getElementById("promotion-backdrop").classList.add("hidden");
+  const { from, to } = pendingPromotion;
+  pendingPromotion = null;
+  commitMove(from, to, btn.dataset.piece);
+});
+
+// ── Navigation / misc ─────────────────────────────────────────────────────────
+document.getElementById("new-game").onclick    = newGame;
+document.querySelector(".brand").onclick = e => { e.preventDefault(); newGame(); };
+document.getElementById("first").onclick    = () => { returnToMainLine(0);           setMove(0); };
+document.getElementById("previous").onclick = () => { const t = current - 1; returnToMainLine(t); setMove(t); };
+document.getElementById("next").onclick     = () => setMove(current + 1);
+document.getElementById("last").onclick     = () => setMove(moves.length - 1);
+document.getElementById("flip").onclick     = () => {
+  flipped = !flipped;
+  board.toggleOrientation();
+  updatePlayerBars();
+  placeBadge();
+};
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+updatePlayerBars();
+setMove(-1);
+startEngine();
